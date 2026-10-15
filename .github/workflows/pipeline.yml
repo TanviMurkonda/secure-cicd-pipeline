@@ -89,6 +89,11 @@ jobs:
     permissions:
       contents: read
       packages: write   # the ONLY job allowed to write to the registry
+      # Lets this job ask GitHub for a short-lived identity token (OIDC).
+      # Cosign trades that token for a signing certificate that says
+      # "this was signed by pipeline.yml in TanviMurkonda/secure-cicd-pipeline".
+      # It does NOT grant any extra access to the repo.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -123,3 +128,78 @@ jobs:
       - name: Push image
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: docker push "$IMAGE:${{ github.sha }}"
+
+      # ---------- SUPPLY CHAIN: SBOM + signature ----------
+      # Analogy: the SBOM is the ingredients label, the signature is the
+      # tamper-evident seal with the factory's name stamped on it.
+
+      # Tags like ":abc123" can be moved to point at a different image.
+      # A digest ("@sha256:...") is a fingerprint of the exact bytes, so it
+      # can never change. We sign and verify the digest, never a tag.
+      - name: Get image digest
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          REF=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:${{ github.sha }}")
+          echo "Pushed image: $REF"
+          echo "IMAGE_REF=$REF" >> "$GITHUB_ENV"
+
+      # SBOM = Software Bill of Materials: a machine-readable list of every
+      # package inside the image, with versions. When the next big CVE drops,
+      # anyone can check "is that package in this image?" in seconds.
+      # CycloneDX is a standard SBOM format. Trivy can generate it too,
+      # so we don't need to trust yet another third-party action.
+      - name: Generate SBOM (CycloneDX)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          # The local copy we just built and pushed: same bytes as IMAGE_REF.
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Install cosign
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: sigstore/cosign-installer@v4.1.2
+
+      # "Keyless" signing: there is no private key file to store or leak.
+      # Cosign uses the OIDC token above to get a certificate valid for
+      # ~10 minutes, signs with it, and records the signature in Rekor,
+      # a public append-only log, so it can't be quietly removed later.
+      # --yes skips the "are you sure?" prompt (no human in CI to answer it).
+      - name: Sign image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cosign sign --yes "$IMAGE_REF"
+
+      # Attach the SBOM to the image as a SIGNED attestation, so the
+      # ingredients list itself is tamper-evident and travels with the image.
+      - name: Attest SBOM
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: cosign attest --yes --type cyclonedx --predicate sbom.cdx.json "$IMAGE_REF"
+
+      # Prove it worked, inside the pipeline itself. Verification checks
+      # WHO signed it: only this exact workflow file, on this branch, in
+      # this repo, via GitHub's identity provider. A signature from anyone
+      # else (even another repo of yours) fails this check.
+      - name: Verify signature and SBOM attestation
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          IDENTITY="https://github.com/${{ github.workflow_ref }}"
+          ISSUER="https://token.actions.githubusercontent.com"
+          cosign verify \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE_REF" > /dev/null
+          cosign verify-attestation --type cyclonedx \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" \
+            "$IMAGE_REF" > /dev/null
+          echo "Signature and SBOM attestation verified for $IMAGE_REF"
+
+      # Also save the SBOM as a downloadable file on the run's Summary page,
+      # so you can open it and see exactly what's inside your image.
+      - name: Upload SBOM artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
