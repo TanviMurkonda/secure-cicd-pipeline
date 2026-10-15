@@ -1,0 +1,59 @@
+# Secure Pipeline — think "airport security for code".
+# Each job is one checkpoint. "needs:" chains them in order, so if one
+# checkpoint fails, every checkpoint after it is skipped and nothing ships.
+
+name: Secure Pipeline
+
+on:
+  push:            # run on every push to any branch
+  pull_request:    # and on every pull request
+
+# Least privilege: by default the workflow's token can only READ the repo.
+# Later, only the job that pushes the image will get write access.
+permissions:
+  contents: read
+
+jobs:
+  # ---------- GATE 1: committed secrets ----------
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Pull the FULL git history, not just the newest commit.
+          # A key committed and then "deleted" later is still in history,
+          # so a shallow checkout would miss it.
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------- GATE 2: insecure code patterns (SAST) ----------
+  sast:
+    needs: secrets-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install bandit
+      # -r app : scan the app/ folder recursively
+      # -ll    : fail only on MEDIUM or HIGH severity (skip noisy LOW findings)
+      # Bandit exits with code 1 when it finds something -> the job fails.
+      - run: bandit -r app -ll
+
+  # ---------- GATE 3: vulnerable dependencies ----------
+  dependency-scan:
+    needs: sast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      # pip-audit exits with code 1 if ANY pinned package has a known CVE.
+      # We trust that exit code. Never grep the output for words like
+      # "CRITICAL" — text matching is how gates silently stop working.
+      - run: pip-audit -r requirements.txt
