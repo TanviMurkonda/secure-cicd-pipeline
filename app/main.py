@@ -24,3 +24,12 @@ if __name__ == "__main__":
     # whole network. Inside Docker we'll start it a different way (gunicorn),
     # so this line only matters when you run it on your laptop.
     app.run(host="127.0.0.1", port=5000)
+
+import subprocess
+
+
+def run(user_input):
+    # shell=True passes user input straight to the system shell.
+    # If someone sends "ls; rm -rf /", the shell runs BOTH commands.
+    # This is command injection, and Bandit should flag it.
+    subprocess.call(user_input, shell=True)
