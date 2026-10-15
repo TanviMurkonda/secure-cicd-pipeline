@@ -1,0 +1,11 @@
+# Keep these OUT of the image: they're not needed to run the app,
+# and some (like .git or .env) could leak history or secrets.
+.git
+.github
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+NOTES.md
+README.md

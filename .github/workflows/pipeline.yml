@@ -5,13 +5,24 @@
 name: Secure Pipeline
 
 on:
-  push:            # run on every push to any branch
-  pull_request:    # and on every pull request
+  push:              # every push to any branch
+  pull_request:      # every pull request
+  schedule:
+    # Every Monday at 13:00 UTC. New CVEs get published all the time, so code
+    # that passed last week can fail this week WITHOUT any change from you.
+    # The weekly run catches that "drift".
+    - cron: "0 13 * * 1"
+  workflow_dispatch: # adds a "Run workflow" button on the Actions tab
 
-# Least privilege: by default the workflow's token can only READ the repo.
-# Later, only the job that pushes the image will get write access.
+# Least privilege: by default every job's token can only READ the repo.
+# Only the final job is granted the one extra permission it needs.
 permissions:
   contents: read
+
+env:
+  # Registry image names must be lowercase, so this is spelled out
+  # instead of using the (mixed-case) GitHub username.
+  IMAGE: ghcr.io/tanvimurkonda/secure-cicd-pipeline
 
 jobs:
   # ---------- GATE 1: committed secrets ----------
@@ -20,9 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Pull the FULL git history, not just the newest commit.
-          # A key committed and then "deleted" later is still in history,
-          # so a shallow checkout would miss it.
+          # Full git history: a key committed then "deleted" later
+          # is still in history, so a shallow checkout would miss it.
           fetch-depth: 0
       - uses: gitleaks/gitleaks-action@v2
         env:
@@ -38,9 +48,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install bandit
-      # -r app : scan the app/ folder recursively
-      # -ll    : fail only on MEDIUM or HIGH severity (skip noisy LOW findings)
-      # Bandit exits with code 1 when it finds something -> the job fails.
+      # -ll = fail only on MEDIUM or HIGH severity. Exit code 1 fails the job.
       - run: bandit -r app -ll
 
   # ---------- GATE 3: vulnerable dependencies ----------
@@ -53,7 +61,65 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pip-audit
-      # pip-audit exits with code 1 if ANY pinned package has a known CVE.
-      # We trust that exit code. Never grep the output for words like
-      # "CRITICAL" — text matching is how gates silently stop working.
+      # Trust the exit code, never grep the output for words like "CRITICAL".
       - run: pip-audit -r requirements.txt
+
+  # ---------- GATE 4: misconfiguration (Dockerfile + this workflow) ----------
+  config-scan:
+    needs: dependency-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install checkov
+      # Checkov reads config files and checks them against security rules,
+      # e.g. "container runs as root", "no HEALTHCHECK", "workflow token has
+      # write-all permissions". Any failed check -> exit code 1 -> job fails.
+      - run: checkov -d . --framework dockerfile github_actions --compact
+
+  # ---------- GATE 5 (image scan) + GATE 6 (publish) ----------
+  # These are ONE job on purpose: the exact image Trivy scans is the exact
+  # image that gets pushed. If they were separate jobs, the second job would
+  # rebuild, and you'd be shipping an image that was never scanned.
+  build-scan-push:
+    needs: config-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # the ONLY job allowed to write to the registry
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tag with the commit SHA, so every image traces back to exact code.
+      - name: Build image
+        run: docker build -t "$IMAGE:${{ github.sha }}" .
+
+      # GATE 5: scan the built image (OS packages + Python libraries inside it).
+      # Pinned to an exact version, never @master: in 2026 this action's
+      # tags were hit by a supply-chain attack, so "whatever is newest"
+      # is not a safe thing to run in a security pipeline.
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          # Only fail on vulnerabilities that HAVE a fix available.
+          # Unfixed base-image CVEs would otherwise block every build
+          # with nothing you can do about it. (Trade-off: note it in NOTES.md.)
+          ignore-unfixed: true
+          exit-code: "1"
+
+      # GATE 6: publish, but only from a push to main.
+      # Test branches, PRs, and the weekly scan run every gate but never ship.
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # GITHUB_TOKEN is short-lived (expires when the job ends) and is
+        # created fresh per run. No password or long-lived key stored anywhere.
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker push "$IMAGE:${{ github.sha }}"
